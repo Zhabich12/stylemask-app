@@ -1,0 +1,6 @@
+# Copy to stylemask.toml (git-ignored) and fill in.
+model = "qwen/qwen3.5-4b"
+base_url = "http://localhost:1234/v1"
+me = ""        # your author label as it appears in data/fragments.jsonl
+persona = ""   # default target author, see `stylemask personas`
+shots = 6

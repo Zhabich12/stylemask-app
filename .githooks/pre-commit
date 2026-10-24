@@ -1,0 +1,8 @@
+#!/bin/sh
+# Chat exports and datasets must stay on this machine — refuse to commit them.
+blocked=$(git diff --cached --name-only --diff-filter=ACMR | grep -iE '^data/|\.jsonl$|messages[0-9]*\.html$|ChatExport')
+if [ -n "$blocked" ]; then
+    echo "pre-commit: refusing to commit private chat data:" >&2
+    echo "$blocked" >&2
+    exit 1
+fi
