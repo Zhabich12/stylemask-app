@@ -67,6 +67,7 @@ HINT_USER = (
 )
 
 _WORD = re.compile(r"\w+")
+EXAMPLE_CHARS = 350  # per example in the prompt
 
 
 def surface_stats(text: str) -> dict[str, float]:
@@ -203,7 +204,7 @@ class Rewriter:
     (a list, or an ExamplePicker) and optionally a `card` from style_card()."""
 
     def __init__(self, llm: LLM, mode: str = "neutral", examples=None, card: str = "",
-                 n_examples: int = 15, guide=None, author=None, hint_maker: HintMaker | None = None,
+                 n_examples: int = 8, guide=None, author=None, hint_maker: HintMaker | None = None,
                  rounds: int = 2, retries: int = 2, temperature: float = 0.3,
                  two_step: bool = True, check: bool = True,
                  notes: list[str] | None = None, approved: list[str] | None = None):
@@ -218,10 +219,12 @@ class Rewriter:
     def _style(self, text: str) -> str:
         if self.mode == "neutral":
             return NEUTRAL_STYLE
-        approved = self.approved[:8]
-        k = max(self.n_examples - len(approved), 5)
+        approved = self.approved[:4]
+        k = max(self.n_examples - len(approved), 4)
         shots = (self.examples.pick(text, k) if isinstance(self.examples, ExamplePicker)
                  else list(self.examples)[:k])
+        # long examples blow up the prompt: the local model runs with a 4k context and slows down a lot
+        approved, shots = [s[:EXAMPLE_CHARS] for s in approved], [s[:EXAMPLE_CHARS] for s in shots]
         notes = NOTES_BLOCK.format(notes="\n".join(f"- {n}" for n in self.notes)) if self.notes else ""
         return PERSONA_STYLE.format(card=self.card or "- (см. примеры)", notes=notes,
                                     examples="\n\n---\n\n".join(approved + shots))

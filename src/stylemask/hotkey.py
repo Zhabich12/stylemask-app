@@ -152,6 +152,22 @@ def foreground_window() -> int:
     return user32.GetForegroundWindow() or 0
 
 
+def wait_for_foreground(hwnd: int, timeout: float = 1.5) -> bool:
+    """True if `hwnd` is (or within `timeout` becomes again) the active window.
+
+    Windows briefly reports no foreground window (0) while focus moves, so a
+    single check can wrongly say the user left; another window means they did.
+    """
+    end = time.time() + timeout
+    while True:
+        fg = foreground_window()
+        if fg == hwnd:
+            return True
+        if fg != 0 or time.time() > end:
+            return False
+        time.sleep(0.05)
+
+
 def window_class(hwnd: int) -> str:
     """Window class name (e.g. Telegram is Qt...), for the event log — titles may hold chat names."""
     buf = ctypes.create_unicode_buffer(256)

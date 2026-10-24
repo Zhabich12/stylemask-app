@@ -69,15 +69,32 @@ class Overlay:
         self.user32.SetWindowPos(self.hwnd, self.HWND_TOPMOST, 0, 0, 0, 0,
                                  self.SWP_NOMOVE | self.SWP_NOSIZE | self.SWP_NOACTIVATE)
 
-    def show(self, text: str, hide_after_ms: int | None = None):
+    def _anchor_rect(self, hwnd: int):
+        """Rect of the window the user is typing in — so the note shows up on *their* monitor."""
+        import ctypes
+        from ctypes import wintypes
+        r = wintypes.RECT()
+        if hwnd and self.user32.IsWindowVisible(hwnd) and self.user32.GetWindowRect(hwnd, ctypes.byref(r)):
+            if r.right - r.left > 200 and r.bottom - r.top > 150:
+                return r.left, r.top, r.right, r.bottom
+        return None
+
+    def show(self, text: str, hide_after_ms: int | None = None, anchor: int = 0):
+        """`anchor`: window handle to sit inside (bottom-right, above its input area)."""
         if self._hide_job:
             self.win.after_cancel(self._hide_job)
             self._hide_job = None
         self.text.set(text)
         self.win.update_idletasks()
         w, h = self.win.winfo_reqwidth(), self.win.winfo_reqheight()
-        x = self.win.winfo_screenwidth() - w - 24
-        y = self.win.winfo_screenheight() - h - 72  # above the taskbar
+        rect = self._anchor_rect(anchor)
+        if rect:
+            left, top, right, bottom = rect
+            x, y = right - w - 20, bottom - h - 90  # inside the window, above a chat input box
+            x, y = max(x, left + 8), max(y, top + 8)
+        else:
+            x = self.win.winfo_screenwidth() - w - 24
+            y = self.win.winfo_screenheight() - h - 72  # above the taskbar
         self._place(x, y, w, h)
         self.visible = True
         if hide_after_ms:
@@ -130,8 +147,10 @@ class App:
         ttk.Label(bottom, textvariable=self.status, foreground="#555").pack(side="left")
 
         self.overlay = Overlay(root)
+        self.anchor = 0          # window the progress note sits in (the one being typed in)
         self.step = ("", 0, 1)   # (label, step number, planned steps) of the running rewrite
         self.started = 0.0
+        self.rewriters = {}      # built rewriters by (mode, persona, feedback state): building one takes seconds
         self._drain()
         self.apply_hotkeys(save=False)
         self._work(self._check_server, self._show_server)
@@ -374,10 +393,15 @@ class App:
             from stylemask.cache import cached_attacker
             self._set_step("Первый запуск: обучаю линейку, ~1 мин", 0, 1)
             self.guide = cached_attacker("style", "all", X_tr, y_tr)
-        try:
-            return build_rewriter(self.llm, mode, persona, X_tr, y_tr, self.cfg, guide=self.guide)
-        except ValueError as e:
-            raise RuntimeError(str(e)) from e
+        key = (mode, persona, tuple(FeedbackStore(persona).counts().values()))
+        if key not in self.rewriters:  # style card + example embeddings take seconds to build
+            self._set_step("Готовлю стиль (только в первый раз)", 0, 1)
+            try:
+                self.rewriters[key] = build_rewriter(self.llm, mode, persona, X_tr, y_tr, self.cfg, guide=self.guide)
+            except ValueError as e:
+                raise RuntimeError(str(e)) from e
+            self.rewriters[key].examples.pick("прогрев", 1)  # embed the example pool now, not mid-rewrite
+        return self.rewriters[key]
 
     # --- progress ----------------------------------------------------------
     def _set_step(self, label: str, n: int, total: int):
@@ -397,7 +421,7 @@ class App:
         counter = f" ({n}/{total})" if n else ""
         text = f"stylemask · {label}{counter} · {elapsed:.0f} с"
         self.status.set(text)
-        self.overlay.show(text)
+        self.overlay.show(text, anchor=self.anchor)
         self.progress["value"] = 100 * max(n - 1, 0) / total + min(elapsed % 10, 9) / total  # creeps within a step
         self.root.after(250, self._tick)
 
@@ -421,14 +445,14 @@ class App:
         if error:
             log.get().error("failed: %s", error)
             self.status.set(f"Ошибка: {error}")
-            self.overlay.show(f"stylemask · ✗ {str(error)[:80]}", hide_after_ms=6000)
+            self.overlay.show(f"stylemask · ✗ {str(error)[:80]}", hide_after_ms=6000, anchor=self.anchor)
             winsound.MessageBeep(winsound.MB_ICONHAND)
             self._work(self._check_server, lambda ok, e: None if ok else self._show_server(ok, e))
         else:
             self.status.set(f"{message} · {elapsed:.0f} с")
             warn = message.startswith("⚠")
             self.overlay.show(f"stylemask · {'⚠ перечитай текст' if warn else '✓ готово'} · {elapsed:.0f} с",
-                              hide_after_ms=6000 if warn else 2500)
+                              hide_after_ms=6000 if warn else 2500, anchor=self.anchor)
 
     def on_hotkey(self, name: str):
         log.get().info("hotkey pressed: %s (busy=%s)", name, self.busy)
@@ -447,8 +471,10 @@ class App:
             self._work(undo, lambda _r, e: self._finish("Исходный текст возвращён", e))
             return
 
-        if not self._start("Беру текст из поля"):
+        if self.busy:
             return
+        self.anchor = hotkey.foreground_window()
+        self._start("Беру текст из поля")
         mode, persona = self.mode.get(), self.persona.get()
 
         def run():
@@ -466,7 +492,7 @@ class App:
             t = time.time()
             result = self._rewrite_with_progress(rw, original)
             lg.info("rewritten in %.1fs: %d chars, warning=%s", time.time() - t, len(result), bool(rw.warning))
-            if hotkey.foreground_window() != window:
+            if not hotkey.wait_for_foreground(window):
                 lg.info("foreground changed to %s: result left in clipboard", hotkey.foreground_window())
                 hotkey.set_clipboard(result)
                 return original, window, "Окно сменилось — результат скопирован в буфер обмена", result
@@ -489,8 +515,10 @@ class App:
 
     def rewrite(self):
         text = self.src.get("1.0", "end").strip()
-        if not text or not self._start("Готовлюсь"):
+        if not text or self.busy:
             return
+        self.anchor = int(self.root.wm_frame(), 16)
+        self._start("Готовлюсь")
         mode, persona = self.mode.get(), self.persona.get()
 
         def run():
@@ -545,7 +573,8 @@ class App:
         self._show_feedback_counts()
 
     def test_overlay(self):
-        self.overlay.show("stylemask · так выглядит индикатор", hide_after_ms=4000)
+        self.overlay.show("stylemask · так выглядит индикатор", hide_after_ms=4000,
+                          anchor=int(self.root.wm_frame(), 16))
         log.get().info("overlay test: rect=%s", self.overlay.win.geometry())
 
     def copy(self):

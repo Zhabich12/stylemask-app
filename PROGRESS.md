@@ -24,7 +24,7 @@
 - LM Studio: `lms server start`; модели `qwen/qwen3.5-4b` (основная, влезает в VRAM), `google/gemma-4-e2b` (медленная), `text-embedding-nomic-embed-text-v1.5` (смысл).
 - Для Qwen/Gemma передаём `reasoning_effort: "none"` — иначе модель «думает» и всё в 10–20 раз медленнее.
 - Железо: 16 ГБ RAM (свободно обычно <1 ГБ — фоновые прогоны может убить система), RTX 3050 Laptop 4 ГБ VRAM.
-- GitHub: публичный репозиторий Zhabich12/stylemask (история до публикации — только в локальной ветке `private-history`), git авторизован через `gh auth setup-git`, коммиты подписываются noreply-адресом.
+- GitHub: публичный репозиторий Zhabich12/stylemask-app (remote `public`, сюда идут коммиты). Старый приватный Zhabich12/stylemask (remote `private`) с полной историей не трогаем; локально она в ветке `private-history`. Коммиты подписываются noreply-адресом. git авторизован через `gh auth setup-git`.
 - Скиллы проекта: `stylometric-fingerprinting`, `scikit-learn`. MCP: `huggingface` (нужен вход через `/mcp`).
 
 ## Данные

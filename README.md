@@ -42,8 +42,8 @@
 - [LM Studio](https://lmstudio.ai/) с моделями `qwen/qwen3.5-4b` (переписывание) и `text-embedding-nomic-embed-text-v1.5` (проверка смысла и подбор примеров). Хватит видеокарты на 4 ГБ.
 
 ```
-git clone https://github.com/Zhabich12/stylemask
-cd stylemask
+git clone https://github.com/Zhabich12/stylemask-app
+cd stylemask-app
 git config core.hooksPath .githooks
 py -m venv .venv
 .venv\Scripts\pip install -e .
