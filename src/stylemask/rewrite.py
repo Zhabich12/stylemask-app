@@ -1,73 +1,84 @@
 """The product itself: rewrite a text so its author can't be recognised.
 
-Pipeline (each step can be switched off for experiments):
-1. facts:  the model lists what the message says — facts, negations,
-           questions, requests. Meaning is pinned down before style changes.
-2. write:  a new message is written from the facts only (never seeing the
-           original wording), in the target style: neutral, or a persona
-           described by a style card + examples similar to this message.
-3. check:  the model compares original and result; on a mismatch the result
-           is rewritten with the list of discrepancies, up to `retries` times.
-4. loop:   (mode="loop") a guide attributor checks whether the author still
-           shows through and, if so, the model gets concrete hints.
+Pipeline:
+1. rephrase: the model rephrases *your* message sentence by sentence, in
+             the same order and with the same roles (who asks, who tells) —
+             it should still read as the message you were writing. For a
+             persona it gets a style card and a few of that person's single
+             messages, explicitly as manner only (examples picked by topic
+             made the model copy their content and replies).
+2. surface:  formatting habits — capital vs. lowercase starts, final periods,
+             one thought per line — are applied by code from the person's real
+             messages; a small model gets these wrong.
+3. check:    the model compares original and result; on a mismatch it
+             rephrases again with the list of discrepancies, up to `retries`.
+4. loop:     (mode="loop") a guide attributor checks whether the author still
+             shows through and, if so, the model gets concrete hints.
 """
-import hashlib
 import random
 import re
 from collections import Counter
+from dataclasses import dataclass
 
 import numpy as np
 
 from stylemask.llm import LLM
 
-FACTS_SYSTEM = (
-    "Перескажи сообщение коротким списком пунктов от первого лица, как будто это заметки автора "
-    "для себя: что произошло, что я думаю и чувствую, о чём спрашиваю или прошу. "
-    "Сохрани все отрицания и вопросы. Ничего не добавляй и не пропускай. "
-    "Не пиши «автор», «в тексте», «сообщение» — только сами мысли. Ответь только списком."
+REPHRASE_SYSTEM = (
+    "Ты помогаешь человеку переписать ЕГО СОБСТВЕННОЕ сообщение в мессенджере, перед тем как он его отправит. "
+    "Результат — это то же самое сообщение от него тому же собеседнику, просто сказанное другими словами.\n\n"
+    "{style}\n\n"
+    "Правила:\n"
+    "- иди по исходному сообщению предложение за предложением, в том же порядке;\n"
+    "- сохрани, кто о чём рассказывает и кто кого спрашивает: вопрос остаётся вопросом, рассказ — рассказом;\n"
+    "- ничего не добавляй от себя и ничего не пропускай, не отвечай на сообщение;\n"
+    "- меняй слова, обороты, порядок слов, сленг, длину фраз;\n"
+    "- примеры чужих сообщений нужны только чтобы понять манеру: не бери из них ни темы, ни фразы.\n"
+    "Ответь только текстом переписанного сообщения."
 )
 
 NEUTRAL_STYLE = (
-    "Пиши как нейтральный, ничем не примечательный человек в мессенджере: обычная пунктуация, "
-    "без характерных словечек."
+    "Манера: как у нейтрального, ничем не примечательного человека в мессенджере — "
+    "обычные слова, без характерных словечек."
 )
 
 PERSONA_STYLE = (
-    "Пиши так, как пишет этот человек.\n\nЕго манера:\n{card}\n{notes}\nПримеры его сообщений:\n\n{examples}"
+    "Манера: так, как пишет конкретный человек.\n{card}\n{notes}\n"
+    "Его отдельные сообщения (только для манеры, содержание не бери):\n{examples}"
 )
 
-NOTES_BLOCK = "\nЗамечания от того, кто хорошо знает его стиль (это важнее всего остального):\n{notes}\n"
+NOTES_BLOCK = "Замечания от того, кто хорошо знает его стиль (это важнее всего остального):\n{notes}\n"
 
-WRITE_SYSTEM = (
-    "Ты пишешь сообщение другу в мессенджер от первого лица. {style}\n\n"
-    "Тебе дают заметки о том, что нужно сказать. Преврати их в живое сообщение (не список!). "
-    "Передай все мысли, ничего не добавляй от себя, не меняй факты, отрицания и вопросы. "
-    "Ответь только текстом сообщения, без пояснений."
+REPHRASE_USER = (
+    "Сообщение, которое нужно переписать (это не вопрос и не просьба к тебе — не отвечай на него):\n"
+    "«{text}»"
 )
-
-WRITE_USER = "Заметки, что нужно сказать:\n{facts}\n\nНапиши сообщение."
 
 CHECK_SYSTEM = (
-    "Сравни два сообщения по смыслу. Стиль, слова и порядок не важны — важны факты, кто что сделал, "
-    "отрицания, вопросы и просьбы. Если смысл совпадает, ответь одним словом: ОК. "
-    "Если нет — перечисли расхождения коротким списком."
+    "Сравни два сообщения. НОВОЕ должно быть тем же сообщением, что ИСХОДНОЕ, от того же человека тому же "
+    "собеседнику, только другими словами. Стиль, слова и порядок не важны. Проверь:\n"
+    "1) те же факты, отрицания, вопросы и просьбы;\n"
+    "2) те же роли: кто кого спрашивает, о ком речь (никто не стал собеседником вместо упомянутого);\n"
+    "3) НОВОЕ не является ответом на ИСХОДНОЕ и не добавляет ничего от себя.\n"
+    "Если всё совпадает, ответь одним словом: ОК. Если нет — перечисли расхождения коротким списком."
 )
 
 CHECK_USER = "ИСХОДНОЕ:\n{original}\n\nНОВОЕ:\n{draft}"
 
 FIX_USER = (
-    "Заметки, что нужно сказать:\n{facts}\n\nТвой прошлый вариант:\n{draft}\n\n"
-    "В нём искажён смысл:\n{problems}\n\nНапиши заново, исправив это."
+    "Исходное сообщение:\n{original}\n\nТвой вариант:\n{draft}\n\n"
+    "В нём искажён смысл:\n{problems}\n\nПерепиши исходное сообщение заново, исправив это."
 )
 
 HINT_USER = (
-    "Заметки, что нужно сказать:\n{facts}\n\nТвой прошлый вариант:\n{draft}\n\n"
+    "Исходное сообщение:\n{original}\n\nТвой вариант:\n{draft}\n\n"
     "По нему всё ещё узнаётся настоящий автор. Что его выдаёт:\n{hints}\n\n"
-    "Напиши заново с учётом этого, смысл сохрани."
+    "Перепиши исходное сообщение заново с учётом этого, смысл сохрани."
 )
 
 _WORD = re.compile(r"\w+")
-EXAMPLE_CHARS = 350  # per example in the prompt
+_SENTENCE_END = re.compile(r"(?<=[.!?…])\s+(?=\S)")
+_PREAMBLE = re.compile(r"^(вот\s+)?(переписанн\w+\s+)?(вариант|сообщение|текст)\w*\s*:\s*", re.I)
 
 
 def surface_stats(text: str) -> dict[str, float]:
@@ -91,18 +102,32 @@ def mean_stats(texts) -> dict[str, float]:
     return {k: float(np.mean([r[k] for r in rows])) for k in rows[0]}
 
 
-def marker_words(person_texts, other_texts, min_count=10, ratio=3.0, top=15) -> list[str]:
-    """Words this person uses far more often than other people, most typical first."""
+# parts of speech that carry manner rather than topic: particles, interjections, adverbs, ...
+_MANNER_POS = {"PRCL", "INTJ", "ADVB", "CONJ", "PRED", "NPRO", "COMP", "PREP", "UNKN", "LATN"}
+
+
+def marker_words(person_texts, other_texts, min_count=10, ratio=3.0, top=15,
+                 manner_only: bool = False) -> list[str]:
+    """Words this person uses far more often than other people, most typical first.
+
+    manner_only keeps filler/slang words ("короче", "ваще", "хз") and drops nouns,
+    verbs and adjectives — those are the person's *topics*, which a rewrite must not import.
+    """
     a = Counter(w.lower() for t in person_texts for w in _WORD.findall(t))
     o = Counter(w.lower() for t in other_texts for w in _WORD.findall(t))
     a_total, o_total = max(1, sum(a.values())), max(1, sum(o.values()))
     scored = [((c / a_total) / ((o[w] + 1) / o_total), w) for w, c in a.items()
               if c >= min_count and not w.isdigit()]
-    return [w for r, w in sorted(scored, reverse=True) if r >= ratio][:top]
+    words = [w for r, w in sorted(scored, reverse=True) if r >= ratio]
+    if manner_only:
+        from stylemask.attribution import _pos
+        # Cyrillic words only: "1й", "2х", "ссд"-like tokens read as noise when inserted
+        words = [w for w in words if _pos(w) in _MANNER_POS and re.fullmatch(r"[а-яё]{2,}", w)]
+    return words[:top]
 
 
 def style_card(person_texts, other_texts) -> str:
-    """Explicit rules describing how a person writes, relative to everyone else."""
+    """Wording habits of a person relative to everyone else (formatting is done by SurfaceProfile)."""
     p, o = mean_stats(person_texts), mean_stats(other_texts)
     rules = []
 
@@ -112,58 +137,61 @@ def style_card(person_texts, other_texts) -> str:
         elif p[key] * factor < o[key]:
             rules.append(less)
 
-    if p["lower_start"] > 0.6:
-        rules.append("почти всегда начинает с маленькой буквы")
-    elif p["lower_start"] < 0.15:
-        rules.append("начинает с заглавной буквы")
-    lines_per_text = np.mean([len([l for l in t.split("\n") if l.strip()]) for t in person_texts])
-    if lines_per_text >= 3:
-        rules.append(f"пишет короткими отдельными сообщениями, по одной мысли на строку (в среднем {p['line_len']:.0f} символов)")
-    else:
-        rules.append(f"пишет связными сообщениями (в среднем {p['line_len']:.0f} символов на строку)")
-    rel("period", "ставит точки в конце предложений", "почти не ставит точки")
-    rel("comma", "любит запятые и длинные фразы", "мало запятых, простые фразы")
-    rel("question", "часто задаёт вопросы", "редко задаёт вопросы")
+    rel("comma", "любит запятые и длинные фразы", "мало запятых, простые короткие фразы")
     rel("exclam", "часто ставит восклицательные знаки", "почти не ставит восклицательных знаков")
     rel("paren", "ставит скобочки-смайлы ) и (", "не ставит скобочек-смайлов")
     rel("ellipsis", "часто использует многоточие", "не использует многоточие")
-    words = marker_words(person_texts, other_texts)
+    words = marker_words(person_texts, other_texts, min_count=5, ratio=2.0, manner_only=True)
     if words:
-        rules.append("характерные слова: " + ", ".join(words))
+        rules.append("характерные словечки (вставляй, где они к месту): " + ", ".join(words))
     return "\n".join(f"- {r}" for r in rules)
 
 
-class ExamplePicker:
-    """Pick the person's messages most similar in topic/length to the text being rewritten.
+def person_messages(texts, min_len: int = 12, max_len: int = 160) -> list[str]:
+    """Single messages of a person: fragments are consecutive messages joined by newlines."""
+    return [l.strip() for t in texts for l in t.split("\n") if min_len <= len(l.strip()) <= max_len]
 
-    Embeddings of the pool are computed once per pool and cached in memory.
-    """
 
-    _cache: dict[str, np.ndarray] = {}
+@dataclass
+class SurfaceProfile:
+    """Formatting habits measured on a person's single messages, applied by code."""
+    lower_start: float   # share of messages starting with a lowercase letter
+    final_period: float  # share of messages ending with "."
+    split_lines: bool    # writes one short thought per message/line
 
-    def __init__(self, llm: LLM, pool: list[str], embed_model: str):
-        self.llm, self.pool, self.embed_model = llm, pool, embed_model
-        self.key = hashlib.sha1("\x00".join(pool).encode()).hexdigest()
+    @classmethod
+    def from_texts(cls, texts) -> "SurfaceProfile":
+        msgs = person_messages(texts, min_len=2, max_len=10_000)
+        lines_per_fragment = np.mean([len([l for l in t.split("\n") if l.strip()]) for t in texts])
+        return cls(
+            lower_start=float(np.mean([m[0].islower() for m in msgs if m[0].isalpha()] or [0])),
+            final_period=float(np.mean([m.endswith(".") and not m.endswith("...") for m in msgs] or [0])),
+            split_lines=bool(lines_per_fragment >= 3 and np.mean([len(m) for m in msgs]) < 70),
+        )
 
-    def _pool_emb(self) -> np.ndarray:
-        if self.key not in self._cache:
-            embs = []
-            for i in range(0, len(self.pool), 64):
-                embs += self.llm.embed(self.pool[i:i + 64], self.embed_model)
-            e = np.array(embs)
-            self._cache[self.key] = e / np.linalg.norm(e, axis=1, keepdims=True)
-        return self._cache[self.key]
+    def _case(self, s: str) -> str:
+        first = s.split(maxsplit=1)[0] if s.strip() else ""
+        acronym = len(first) > 1 and first.isupper()  # keep "МТС", "OK"
+        if self.lower_start > 0.6 and s[:1].isupper() and not acronym:
+            return s[0].lower() + s[1:]
+        if self.lower_start < 0.15 and s[:1].islower():
+            return s[0].upper() + s[1:]
+        return s
 
-    def pick(self, text: str, k: int) -> list[str]:
-        if len(self.pool) <= k:
-            return list(self.pool)
-        try:
-            pool = self._pool_emb()
-            q = np.array(self.llm.embed([text], self.embed_model)[0])
-            order = np.argsort(-(pool @ (q / np.linalg.norm(q))))
-            return [self.pool[i] for i in order[:k]]
-        except Exception:  # embedding model unavailable: random examples still work
-            return random.Random(0).sample(self.pool, k)
+    def apply(self, text: str) -> str:
+        lines = [l.strip() for l in text.split("\n") if l.strip()]
+        out = []
+        for line in lines:
+            sentences = [s.strip() for s in _SENTENCE_END.split(line) if s.strip()]
+            fixed = []
+            for i, s in enumerate(sentences):
+                # drop a period only where a message ends: mid-line ones keep sentences apart
+                ends_message = self.split_lines or i == len(sentences) - 1
+                if ends_message and self.final_period < 0.15 and s.endswith(".") and not s.endswith("..."):
+                    s = s[:-1]
+                fixed.append(self._case(s))
+            out += fixed if self.split_lines else [" ".join(fixed)]
+        return ("\n" if self.split_lines else " ").join(out) if out else text
 
 
 class HintMaker:
@@ -200,37 +228,44 @@ class HintMaker:
 
 
 class Rewriter:
-    """mode: "neutral" | "persona" | "loop". For persona/loop pass `examples`
-    (a list, or an ExamplePicker) and optionally a `card` from style_card()."""
+    """mode: "neutral" | "persona" | "loop".
+
+    For persona/loop: `examples` are the person's single messages (see person_messages),
+    `card` comes from style_card(), `surface` from SurfaceProfile.from_texts().
+    """
 
     def __init__(self, llm: LLM, mode: str = "neutral", examples=None, card: str = "",
-                 n_examples: int = 8, guide=None, author=None, hint_maker: HintMaker | None = None,
-                 rounds: int = 2, retries: int = 2, temperature: float = 0.3,
-                 two_step: bool = True, check: bool = True,
+                 surface: SurfaceProfile | None = None, n_examples: int = 8,
+                 guide=None, author=None, hint_maker: HintMaker | None = None,
+                 rounds: int = 2, retries: int = 2, temperature: float = 0.3, check: bool = True,
                  notes: list[str] | None = None, approved: list[str] | None = None):
-        self.llm, self.mode, self.card, self.n_examples = llm, mode, card, n_examples
-        self.examples = examples
+        self.llm, self.mode, self.card, self.surface = llm, mode, card, surface
+        self.examples, self.n_examples = list(examples or []), n_examples
+        self.guide, self.author, self.hint_maker, self.rounds = guide, author, hint_maker, rounds
+        self.retries, self.temperature, self.check = retries, temperature, check
         # user feedback: remarks about the style, and approved/hand-fixed messages
         self.notes, self.approved = notes or [], approved or []
-        self.guide, self.author, self.hint_maker, self.rounds = guide, author, hint_maker, rounds
-        self.retries, self.temperature, self.two_step, self.check = retries, temperature, two_step, check
         self.warning = ""  # set when the meaning check still fails after all retries
 
     def _style(self, text: str) -> str:
         if self.mode == "neutral":
             return NEUTRAL_STYLE
-        approved = self.approved[:4]
+        approved = [a[:300] for a in self.approved[:4]]
         k = max(self.n_examples - len(approved), 4)
-        shots = (self.examples.pick(text, k) if isinstance(self.examples, ExamplePicker)
-                 else list(self.examples)[:k])
-        # long examples blow up the prompt: the local model runs with a 4k context and slows down a lot
-        approved, shots = [s[:EXAMPLE_CHARS] for s in approved], [s[:EXAMPLE_CHARS] for s in shots]
+        # varied but stable per text: same input -> same prompt
+        rnd = random.Random(text)
+        shots = rnd.sample(self.examples, min(k, len(self.examples)))
         notes = NOTES_BLOCK.format(notes="\n".join(f"- {n}" for n in self.notes)) if self.notes else ""
-        return PERSONA_STYLE.format(card=self.card or "- (см. примеры)", notes=notes,
-                                    examples="\n\n---\n\n".join(approved + shots))
+        return PERSONA_STYLE.format(card=self.card, notes=notes,
+                                    examples="\n".join(f"• {s}" for s in approved + shots))
 
     def _chat(self, system: str, user: str) -> str:
         return self.llm.chat(system, user, temperature=self.temperature)
+
+    def _finish(self, draft: str) -> str:
+        draft = _PREAMBLE.sub("", draft.strip())  # "Вот вариант:", "Переписанное сообщение:" ...
+        draft = draft.strip().strip("«»\"").strip()  # the model sometimes echoes our quotes
+        return self.surface.apply(draft) if self.surface else draft
 
     def _meaning_problems(self, original: str, draft: str) -> str:
         verdict = self.llm.chat(CHECK_SYSTEM, CHECK_USER.format(original=original, draft=draft),
@@ -244,7 +279,7 @@ class Rewriter:
 
     def planned_steps(self) -> int:
         """Steps on the happy path (no retries, loop not triggered) — for progress display."""
-        return 1 + self.two_step + (self.mode != "neutral") + self.check
+        return 1 + self.check
 
     def rewrite(self, text: str, on_step=None) -> str:
         """`on_step(label, step_no)` is called before each slow step, from the calling thread."""
@@ -257,18 +292,9 @@ class Rewriter:
             if on_step:
                 on_step(label, n)
 
-        if self.mode != "neutral":
-            step("Подбираю примеры стиля")
-        system = WRITE_SYSTEM.format(style=self._style(text))
-        if self.two_step:
-            step("Разбираю смысл")
-            facts = self._chat(FACTS_SYSTEM, text)
-            step("Пишу")
-            draft = self._chat(system, WRITE_USER.format(facts=facts))
-        else:
-            facts = text
-            step("Пишу")
-            draft = self._chat(system, text)
+        system = REPHRASE_SYSTEM.format(style=self._style(text))
+        step("Переписываю")
+        draft = self._finish(self._chat(system, REPHRASE_USER.format(text=text)))
 
         if self.mode == "loop":
             for r in range(self.rounds):
@@ -278,8 +304,8 @@ class Rewriter:
                 if not hints:
                     break
                 step(f"Убираю твои приметы (раунд {r + 1})")
-                draft = self._chat(system, HINT_USER.format(
-                    facts=facts, draft=draft, hints="\n".join(f"- {h}" for h in hints)))
+                draft = self._finish(self._chat(system, HINT_USER.format(
+                    original=text, draft=draft, hints="\n".join(f"- {h}" for h in hints))))
 
         if self.check:
             for attempt in range(self.retries + 1):
@@ -291,5 +317,6 @@ class Rewriter:
                     self.warning = "смысл мог измениться: " + problems
                     break
                 step(f"Исправляю смысл (попытка {attempt + 1})")
-                draft = self._chat(system, FIX_USER.format(facts=facts, draft=draft, problems=problems))
+                draft = self._finish(self._chat(system, FIX_USER.format(
+                    original=text, draft=draft, problems=problems)))
         return draft

@@ -7,7 +7,7 @@ from pathlib import Path
 from stylemask.dataset import CUSTOM_STYLES
 from stylemask.feedback import FeedbackStore
 from stylemask.llm import LLM
-from stylemask.rewrite import ExamplePicker, HintMaker, Rewriter, style_card
+from stylemask.rewrite import HintMaker, Rewriter, SurfaceProfile, person_messages, style_card
 from stylemask.telegram import parse_export, to_fragments
 
 
@@ -27,17 +27,17 @@ def build_rewriter(llm: LLM, mode: str, persona: str, X_tr, y_tr, cfg: dict,
         raise ValueError(f"нет текстов для {persona!r}")
     others = [x for x, y in zip(X_tr, y_tr) if y != persona]
     others = random.Random(0).sample(others, min(2000, len(others)))
-    card = style_card(pool, others)
-    picker = ExamplePicker(llm, pool, cfg["embed_model"])
     fb = FeedbackStore(persona)
-    rewriter_kwargs = {"notes": fb.notes(), "approved": fb.examples(), **rewriter_kwargs}
+    rewriter_kwargs = {"card": style_card(pool, others), "surface": SurfaceProfile.from_texts(pool),
+                       "notes": fb.notes(), "approved": fb.examples(), **rewriter_kwargs}
+    examples = person_messages(pool)
     if mode == "loop":
         me = cfg["me"]
         if not me:
             raise ValueError("для проверки укажи me = \"...\" в stylemask.toml")
-        return Rewriter(llm, "loop", picker, card, guide=guide, author=me,
+        return Rewriter(llm, "loop", examples, guide=guide, author=me,
                         hint_maker=HintMaker(X_tr, y_tr, me, target=persona), **rewriter_kwargs)
-    return Rewriter(llm, "persona", picker, card, **rewriter_kwargs)
+    return Rewriter(llm, "persona", examples, **rewriter_kwargs)
 
 
 def export_authors(folder: Path) -> Counter:

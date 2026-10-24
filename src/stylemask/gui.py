@@ -400,7 +400,6 @@ class App:
                 self.rewriters[key] = build_rewriter(self.llm, mode, persona, X_tr, y_tr, self.cfg, guide=self.guide)
             except ValueError as e:
                 raise RuntimeError(str(e)) from e
-            self.rewriters[key].examples.pick("прогрев", 1)  # embed the example pool now, not mid-rewrite
         return self.rewriters[key]
 
     # --- progress ----------------------------------------------------------

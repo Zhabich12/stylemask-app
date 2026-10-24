@@ -79,7 +79,7 @@ llm = LLM(args.model)
 rewriters = {}
 if args.legacy:
     shots = random.Random(2).sample([x for x, y in zip(P_tr, py_tr) if y == persona], args.shots)
-    legacy = dict(two_step=False, check=False, temperature=0.7, n_examples=args.shots)
+    legacy = dict(check=False, temperature=0.7, n_examples=args.shots)
 for a in authors:
     if args.legacy:
         hm = HintMaker(X_tr, y_tr, a, target=persona if persona in set(y_tr) else None) if args.method == "loop" else None
@@ -96,7 +96,7 @@ if cache_path.exists():
         row = json.loads(line)
         cache[row["key"]] = row["rewritten"]
 
-version = "" if args.legacy else "|v2"  # legacy keeps v1 cache keys, so old rewrites are reused as is
+version = "" if args.legacy else "|v3"  # legacy keeps v1 cache keys, so old rewrites are reused as is
 tag = f"{args.method}|{persona if args.method != 'neutral' else ''}|{args.model}|{args.shots}{version}"
 rewritten, warned, t0 = [], 0, time.time()
 with cache_path.open("a", encoding="utf-8") as f:
